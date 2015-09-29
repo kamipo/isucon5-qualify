@@ -8,26 +8,47 @@ use Kossy;
 use DBIx::Sunny;
 use Encode;
 
+my %users_by_id = ();
+my %users_by_name = ();
+my %users_by_email = ();
+my %relations = ();
+{
+    my $db = dbh();
+
+    for my $user (@{$db->select_all('SELECT id, account_name, nick_name, email, account_name AS password FROM users')}) {
+        $users_by_id{$user->{id}} = $user;
+        $users_by_name{$user->{account_name}} = $user;
+        $users_by_email{$user->{email}} = $user;
+    }
+
+    for my $rel (@{$db->select_all('SELECT one, another FROM relations WHERE id <= 500000')}) {
+        $relations{$rel->{one}} ||= {};
+        $relations{$rel->{one}}{$rel->{another}} = 1;
+    }
+}
+
+sub dbh {
+    my %db = (
+        host => $ENV{ISUCON5_DB_HOST} || 'localhost',
+        port => $ENV{ISUCON5_DB_PORT} || 3306,
+        username => $ENV{ISUCON5_DB_USER} || 'root',
+        password => $ENV{ISUCON5_DB_PASSWORD},
+        database => $ENV{ISUCON5_DB_NAME} || 'isucon5q',
+    );
+    DBIx::Sunny->connect(
+        "dbi:mysql:database=$db{database};host=$db{host};port=$db{port}", $db{username}, $db{password}, {
+            RaiseError => 1,
+            PrintError => 0,
+            AutoInactiveDestroy => 1,
+            mysql_enable_utf8   => 1,
+            mysql_auto_reconnect => 1,
+        },
+    );
+}
+
 my $db;
 sub db {
-    $db ||= do {
-        my %db = (
-            host => $ENV{ISUCON5_DB_HOST} || 'localhost',
-            port => $ENV{ISUCON5_DB_PORT} || 3306,
-            username => $ENV{ISUCON5_DB_USER} || 'root',
-            password => $ENV{ISUCON5_DB_PASSWORD},
-            database => $ENV{ISUCON5_DB_NAME} || 'isucon5q',
-        );
-        DBIx::Sunny->connect(
-            "dbi:mysql:database=$db{database};host=$db{host};port=$db{port}", $db{username}, $db{password}, {
-                RaiseError => 1,
-                PrintError => 0,
-                AutoInactiveDestroy => 1,
-                mysql_enable_utf8   => 1,
-                mysql_auto_reconnect => 1,
-            },
-        );
-    };
+    $db ||= dbh();
 }
 
 my ($SELF, $C);
@@ -58,14 +79,8 @@ sub abort_content_not_found {
 
 sub authenticate {
     my ($email, $password) = @_;
-    my $query = <<SQL;
-SELECT u.id AS id, u.account_name AS account_name, u.nick_name AS nick_name, u.email AS email
-FROM users u
-JOIN salts s ON u.id = s.user_id
-WHERE u.email = ? AND u.passhash = SHA2(CONCAT(?, s.salt), 512)
-SQL
-    my $result = db->select_row($query, $email, $password);
-    if (!$result) {
+    my $result = $users_by_email{$email};
+    if (!$result or $result->{password} ne $password) {
         abort_authentication_error();
     }
     session()->{user_id} = $result->{id};
@@ -80,7 +95,7 @@ sub current_user {
 
     return undef if (!session()->{user_id});
 
-    $user = db->select_row('SELECT id, account_name, nick_name, email FROM users WHERE id=?', session()->{user_id});
+    $user = $users_by_id{session()->{user_id}};
     if (!$user) {
         session()->{user_id} = undef;
         abort_authentication_error();
@@ -97,14 +112,14 @@ sub set_user_names {
 
 sub get_user {
     my ($user_id) = @_;
-    my $user = db->select_row('SELECT * FROM users WHERE id = ?', $user_id);
+    my $user = $users_by_id{$user_id};
     abort_content_not_found() if (!$user);
     return $user;
 }
 
 sub user_from_account {
     my ($account_name) = @_;
-    my $user = db->select_row('SELECT * FROM users WHERE account_name = ?', $account_name);
+    my $user = $users_by_name{$account_name};
     abort_content_not_found() if (!$user);
     return $user;
 }
@@ -112,6 +127,7 @@ sub user_from_account {
 sub is_friend {
     my ($another_id) = @_;
     my $user_id = session()->{user_id};
+    return 1 if $relations{$user_id}{$another_id};
     my $query = 'SELECT COUNT(1) AS cnt FROM relations WHERE (one = ? AND another = ?) OR (one = ? AND another = ?)';
     my $cnt = db->select_one($query, $user_id, $another_id, $another_id, $user_id);
     return $cnt > 0 ? 1 : 0;
