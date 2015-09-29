@@ -128,8 +128,8 @@ sub is_friend {
     my ($another_id) = @_;
     my $user_id = session()->{user_id};
     return 1 if $relations{$user_id}{$another_id};
-    my $query = 'SELECT COUNT(1) AS cnt FROM relations WHERE (one = ? AND another = ?) OR (one = ? AND another = ?)';
-    my $cnt = db->select_one($query, $user_id, $another_id, $another_id, $user_id);
+    my $query = 'SELECT COUNT(1) AS cnt FROM relations WHERE one = ? AND another = ?';
+    my $cnt = db->select_one($query, $user_id, $another_id);
     return $cnt > 0 ? 1 : 0;
 }
 
@@ -252,20 +252,6 @@ SQL
         last if @$comments_of_friends+0 >= 10;
     }
 
-    my $friends_query = 'SELECT * FROM relations WHERE one = ? OR another = ? ORDER BY created_at DESC';
-    my %friends = ();
-    my $friends = [];
-    for my $rel (@{db->select_all($friends_query, current_user()->{id}, current_user()->{id})}) {
-        my $key = ($rel->{one} == current_user()->{id} ? 'another' : 'one');
-        $friends{$rel->{$key}} ||= do {
-            my $friend = get_user($rel->{$key});
-            $rel->{account_name} = $friend->{account_name};
-            $rel->{nick_name} = $friend->{nick_name};
-            push @$friends, $rel;
-            $rel;
-        };
-    }
-
     my $query = <<SQL;
 SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) as updated
 FROM footprints
@@ -286,7 +272,6 @@ SQL
         'comments_for_me' => $comments_for_me,
         'entries_of_friends' => $entries_of_friends,
         'comments_of_friends' => $comments_of_friends,
-        'friends' => $friends,
         'footprints' => $footprints
     };
     $c->render('index.tx', $locals);
@@ -453,15 +438,10 @@ SQL
 
 get '/friends' => [qw(set_global authenticated)] => sub {
     my ($self, $c) = @_;
-    my $query = 'SELECT * FROM relations WHERE one = ? OR another = ? ORDER BY created_at DESC';
-    my %friends = ();
+    my $query = 'SELECT * FROM relations WHERE one = ? ORDER BY id DESC';
     my $friends = [];
-    for my $rel (@{db->select_all($query, current_user()->{id}, current_user()->{id})}) {
-        my $key = ($rel->{one} == current_user()->{id} ? 'another' : 'one');
-        $friends{$rel->{$key}} ||= do {
-            push @$friends, set_user_names($rel, get_user($rel->{$key}));
-            $rel;
-        };
+    for my $rel (@{db->select_all($query, current_user()->{id})}) {
+        push @$friends, set_user_names($rel, get_user($rel->{another}));
     }
     $c->render('friends.tx', { friends => $friends });
 };
@@ -473,6 +453,7 @@ post '/friends/:account_name' => [qw(set_global authenticated)] => sub {
         my $user = user_from_account($account_name);
         abort_content_not_found() if (!$user);
         db->query('INSERT INTO relations (one, another) VALUES (?,?), (?,?)', current_user()->{id}, $user->{id}, $user->{id}, current_user()->{id});
+        db->query('UPDATE profiles SET friends = friends + 1 WHERE user_id IN (?,?)', current_user()->{id}, $user->{id});
         redirect('/friends');
     }
 };
@@ -483,6 +464,16 @@ get '/initialize' => sub {
     db->query("DELETE FROM footprints WHERE id > 500000");
     db->query("DELETE FROM entries WHERE id > 500000");
     db->query("DELETE FROM comments WHERE id > 1500000");
+    db->query(<<SQL);
+UPDATE profiles p
+JOIN (SELECT one, COUNT(*) AS friends FROM relations GROUP BY one) r
+ON p.user_id = r.one SET p.friends = r.friends
+SQL
 };
 
 1;
+
+__END__
+
+ALTER TABLE profiles ADD COLUMN friends int AFTER pref;
+ALTER TABLE relations ADD INDEX friendlist (one);
