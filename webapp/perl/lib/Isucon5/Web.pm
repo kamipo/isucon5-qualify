@@ -141,7 +141,7 @@ sub is_friend_account {
 sub mark_footprint {
     my ($user_id) = @_;
     if ($user_id != current_user()->{id}) {
-        my $query = 'INSERT INTO footprints (user_id,owner_id) VALUES (?,?)';
+        my $query = 'REPLACE INTO footprints (user_id,owner_id,date) VALUES (?,?,NOW())';
         db->query($query, $user_id, current_user()->{id});
     }
 }
@@ -252,14 +252,7 @@ SQL
         last if @$comments_of_friends+0 >= 10;
     }
 
-    my $query = <<SQL;
-SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) as updated
-FROM footprints
-WHERE user_id = ?
-GROUP BY user_id, owner_id, DATE(created_at)
-ORDER BY updated DESC
-LIMIT 10
-SQL
+    my $query = 'SELECT owner_id, created_at AS updated FROM footprints WHERE user_id = ? ORDER BY id DESC LIMIT 10';
     my $footprints = [];
     for my $fp (@{db->select_all($query, current_user()->{id})}) {
         push @$footprints, set_user_names($fp, get_user($fp->{owner_id}));
@@ -421,14 +414,7 @@ post '/diary/comment/:entry_id' => [qw(set_global authenticated)] => sub {
 
 get '/footprints' => [qw(set_global authenticated)] => sub {
     my ($self, $c) = @_;
-    my $query = <<SQL;
-SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) as updated
-FROM footprints
-WHERE user_id = ?
-GROUP BY user_id, owner_id, DATE(created_at)
-ORDER BY updated DESC
-LIMIT 50
-SQL
+    my $query = 'SELECT owner_id, created_at AS updated FROM footprints WHERE user_id = ? ORDER BY id DESC LIMIT 50';
     my $footprints = [];
     for my $fp (@{db->select_all($query, current_user()->{id})}) {
         push @$footprints, set_user_names($fp, get_user($fp->{owner_id}));
@@ -477,3 +463,25 @@ __END__
 
 ALTER TABLE profiles ADD COLUMN friends int AFTER pref;
 ALTER TABLE relations ADD INDEX friendlist (one);
+
+CREATE TABLE fp LIKE footprints;
+ALTER TABLE fp ADD COLUMN date date NOT NULL, ADD UNIQUE INDEX unique_per_day (user_id,owner_id,date), ADD INDEX user_id (user_id);
+REPLACE INTO fp SELECT id, user_id, owner_id, created_at, DATE(created_at) FROM footprints WHERE id <= 500000;
+RENAME TABLE footprints TO footprints_old, fp TO footprints;
+
+-- /etc/mysql/mysql.conf.d/mysqld.cnf
+[mysqld]
+performance_schema = OFF
+transaction_isolation = READ-COMMITTED
+
+innodb_strict_mode
+innodb_file_format = Barracuda
+innodb_autoinc_lock_mode = 2
+
+innodb_buffer_pool_size = 2G
+innodb_log_file_size = 128M
+innodb_flush_log_at_trx_commit = 0
+innodb_doublewrite = 0
+
+innodb_buffer_pool_dump_at_shutdown
+innodb_buffer_pool_load_at_startup
