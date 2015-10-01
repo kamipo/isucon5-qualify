@@ -234,14 +234,15 @@ SQL
     }
 
     my $entries_of_friends_query = <<SQL;
-SELECT id, user_id, SUBSTRING_INDEX(body, '\n', 1) AS title, created_at
-FROM entries
-WHERE user_id IN (?)
-ORDER BY id DESC
+SELECT e.id AS id, e.user_id AS user_id, SUBSTRING_INDEX(e.body, '\n', 1) AS title, e.created_at AS created_at
+FROM entries_of_friends eof
+JOIN entries e ON eof.entry_id = e.id
+WHERE eof.user_id = ?
+ORDER BY eof.entry_id DESC
 LIMIT 10
 SQL
     my $entries_of_friends = [];
-    for my $entry (@{db->select_all($entries_of_friends_query, $friend_ids)}) {
+    for my $entry (@{db->select_all($entries_of_friends_query, current_user()->{id})}) {
         push @$entries_of_friends, set_user_names($entry, get_user($entry->{user_id}));
     }
 
@@ -406,6 +407,15 @@ post '/diary/entry' => [qw(set_global authenticated)] => sub {
     my $private = $c->req->param('private');
     my $body = ($title || "タイトルなし") . "\n" . $content;
     db->query($query, current_user()->{id}, ($private ? '1' : '0'), $body);
+
+    my $entry_id = db->last_insert_id;
+    my @values = ();
+    for my $rel (@{db->select_all('SELECT another FROM relations WHERE one = ?', current_user()->{id})}) {
+        my $friend_id = $rel->{another};
+        push @values, "($friend_id,$entry_id)";
+    }
+    db->query('INSERT INTO entries_of_friends VALUES ' . join q{,}, @values) if 0+@values;
+
     redirect('/diary/entries/'.current_user()->{account_name});
 };
 
@@ -456,15 +466,23 @@ post '/friends/:account_name' => [qw(set_global authenticated)] => sub {
         abort_content_not_found() if (!$user);
         db->query('INSERT INTO relations (one, another) VALUES (?,?), (?,?)', current_user()->{id}, $user->{id}, $user->{id}, current_user()->{id});
         db->query('UPDATE profiles SET friends = friends + 1 WHERE user_id IN (?,?)', current_user()->{id}, $user->{id});
+
+        insert_entries_of_friends(current_user()->{id}, $user->{id});
+        insert_entries_of_friends($user->{id}, current_user()->{id});
+
         redirect('/friends');
     }
 };
 
 get '/initialize' => sub {
     my ($self, $c) = @_;
+    for my $rel (@{db->select_all('SELECT one, another FROM relations WHERE id > 500000')}) {
+        delete_entries_of_friends($rel->{one}, $rel->{another});
+    }
     db->query("DELETE FROM relations WHERE id > 500000");
     db->query("DELETE FROM footprints WHERE id > 500000");
     db->query("DELETE FROM entries WHERE id > 500000");
+    db->query("DELETE FROM entries_of_friends WHERE entry_id > 500000");
     db->query("DELETE FROM comments WHERE id > 1500000");
     db->query("DELETE FROM comments_for_me WHERE comment_id > 1500000");
     db->query(<<SQL);
@@ -477,6 +495,7 @@ SQL
 get '/initialize_inbox' => sub {
     my ($self, $c) = @_;
     initialize_comments_for_me();
+    initialize_entries_of_friends();
     return 'initialized';
 };
 
@@ -492,6 +511,39 @@ SQL
     for my $user_id (1..5000) {
         db->query($query, $user_id);
         say "comments_for_me < user_id: $user_id";
+    }
+}
+
+sub insert_entries_of_friends {
+    my ($user_id, $friend_id) = @_;
+    my @values = ();
+    for my $entry (@{db->select_all('SELECT id FROM entries WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', $user_id)}) {
+        my $entry_id = $entry->{id};
+        push @values, "($friend_id,$entry_id)";
+    }
+    db->query('INSERT INTO entries_of_friends VALUES ' . join q{,}, @values) if 0+@values;
+}
+
+sub delete_entries_of_friends {
+    my ($user_id, $friend_id) = @_;
+    my $entry_ids = [];
+    for my $entry (@{db->select_all('SELECT id FROM entries WHERE user_id = ?', $user_id)}) {
+        my $entry_id = $entry->{id};
+        push @$entry_ids, $entry_id;
+    }
+    db->query('DELETE FROM entries_of_friends WHERE user_id = ? AND entry_id IN (?)', $friend_id, $entry_ids);
+}
+
+sub initialize_entries_of_friends {
+    for my $entry (@{db->select_all('SELECT id, user_id FROM entries ORDER BY id DESC LIMIT 1000')}) {
+        my $user_id = $entry->{user_id};
+        my $entry_id = $entry->{id};
+        my @values = ();
+        for my $friend_id (keys %{$relations{$user_id}}) {
+            push @values, "($friend_id,$entry_id)";
+        }
+        db->query('INSERT INTO entries_of_friends VALUES ' . join q{,}, @values) if 0+@values;
+        say "entries_of_friends < entry_id: $entry_id";
     }
 }
 
@@ -514,6 +566,13 @@ CREATE TABLE `comments_for_me` (
   `user_id` int NOT NULL,
   `comment_id` int NOT NULL,
   PRIMARY KEY (`user_id`,`comment_id`)
+) ENGINE=InnoDB CHARSET=utf8mb4;
+
+DROP TABLE IF EXISTS `entries_of_friends`;
+CREATE TABLE `entries_of_friends` (
+  `user_id` int NOT NULL,
+  `entry_id` int NOT NULL,
+  PRIMARY KEY (`user_id`,`entry_id`)
 ) ENGINE=InnoDB CHARSET=utf8mb4;
 
 -- /etc/mysql/mysql.conf.d/mysqld.cnf
