@@ -125,8 +125,8 @@ sub user_from_account {
 }
 
 sub is_friend {
-    my ($another_id) = @_;
-    my $user_id = session()->{user_id};
+    my ($another_id, $user_id) = @_;
+    $user_id ||= session()->{user_id};
     return 1 if $relations{$user_id}{$another_id};
     my $query = 'SELECT COUNT(1) AS cnt FROM relations WHERE one = ? AND another = ?';
     my $cnt = db->select_one($query, $user_id, $another_id);
@@ -147,8 +147,9 @@ sub mark_footprint {
 }
 
 sub permitted {
-    my ($another_id) = @_;
-    $another_id == current_user()->{id} || is_friend($another_id);
+    my ($another_id, $user_id) = @_;
+    $user_id ||= current_user()->{id};
+    $another_id == $user_id || is_friend($another_id, $user_id);
 }
 
 my $PREFS;
@@ -228,11 +229,6 @@ SQL
         push @$comments_for_me, set_user_names($comment, get_user($comment->{user_id}));
     }
 
-    my $friend_ids = [];
-    for my $rel (@{db->select_all('SELECT another FROM relations WHERE one = ?', current_user()->{id})}) {
-        push @$friend_ids, $rel->{another};
-    }
-
     my $entries_of_friends_query = <<SQL;
 SELECT e.id AS id, e.user_id AS user_id, SUBSTRING_INDEX(e.body, '\n', 1) AS title, e.created_at AS created_at
 FROM entries_of_friends eof
@@ -247,20 +243,15 @@ SQL
     }
 
     my $comments_of_friends_query = <<SQL;
-SELECT c.user_id AS user_id, c.comment AS comment, c.created_at AS created_at, e.user_id AS entry_user_id
-FROM comments c
-JOIN entries e ON c.entry_id = e.id
-WHERE c.user_id IN (?)
-AND (
-  e.private = 0
-  OR
-  e.private = 1 AND (e.user_id = ? OR e.user_id IN (?))
-)
-ORDER BY c.id DESC
+SELECT c.user_id AS user_id, c.comment AS comment, c.created_at AS created_at, cof.entry_user_id AS entry_user_id
+FROM comments_of_friends cof
+JOIN comments c ON cof.comment_id = c.id
+WHERE cof.user_id = ?
+ORDER BY cof.comment_id DESC
 LIMIT 10
 SQL
     my $comments_of_friends = [];
-    for my $comment (@{db->select_all($comments_of_friends_query, $friend_ids, current_user()->{id}, $friend_ids)}) {
+    for my $comment (@{db->select_all($comments_of_friends_query, current_user()->{id})}) {
         $comment->{entry} = set_user_names(+{}, get_user($comment->{entry_user_id}));
         push @$comments_of_friends, set_user_names($comment, get_user($comment->{user_id}));
     }
@@ -435,6 +426,17 @@ post '/diary/comment/:entry_id' => [qw(set_global authenticated)] => sub {
     my $comment_id = db->last_insert_id;
     db->query('INSERT INTO comments_for_me VALUES (?,?)', $entry->{user_id}, $comment_id);
 
+    my @values = ();
+    my $entry_user_id = $entry->{user_id};
+    for my $rel (@{db->select_all('SELECT another FROM relations WHERE one = ?', current_user()->{id})}) {
+        my $friend_id = $rel->{another};
+        if ($entry->{is_private} && !permitted($entry_user_id, $friend_id)) {
+            next;
+        }
+        push @values, "($friend_id,$comment_id,$entry_user_id)";
+    }
+    db->query('INSERT INTO comments_of_friends VALUES ' . join q{,}, @values) if 0+@values;
+
     redirect('/diary/entry/'.$entry->{id});
 };
 
@@ -469,6 +471,8 @@ post '/friends/:account_name' => [qw(set_global authenticated)] => sub {
 
         insert_entries_of_friends(current_user()->{id}, $user->{id});
         insert_entries_of_friends($user->{id}, current_user()->{id});
+        insert_comments_of_friends(current_user()->{id}, $user->{id});
+        insert_comments_of_friends($user->{id}, current_user()->{id});
 
         redirect('/friends');
     }
@@ -478,6 +482,7 @@ get '/initialize' => sub {
     my ($self, $c) = @_;
     for my $rel (@{db->select_all('SELECT one, another FROM relations WHERE id > 500000')}) {
         delete_entries_of_friends($rel->{one}, $rel->{another});
+        delete_comments_of_friends($rel->{one}, $rel->{another});
     }
     db->query("DELETE FROM relations WHERE id > 500000");
     db->query("DELETE FROM footprints WHERE id > 500000");
@@ -485,6 +490,7 @@ get '/initialize' => sub {
     db->query("DELETE FROM entries_of_friends WHERE entry_id > 500000");
     db->query("DELETE FROM comments WHERE id > 1500000");
     db->query("DELETE FROM comments_for_me WHERE comment_id > 1500000");
+    db->query("DELETE FROM comments_of_friends WHERE comment_id > 1500000");
     db->query(<<SQL);
 UPDATE profiles p
 JOIN (SELECT one, COUNT(*) AS friends FROM relations GROUP BY one) r
@@ -496,6 +502,7 @@ get '/initialize_inbox' => sub {
     my ($self, $c) = @_;
     initialize_comments_for_me();
     initialize_entries_of_friends();
+    initialize_comments_of_friends();
     return 'initialized';
 };
 
@@ -547,6 +554,60 @@ sub initialize_entries_of_friends {
     }
 }
 
+sub insert_comments_of_friends {
+    my ($user_id, $friend_id) = @_;
+    my $query = <<SQL;
+SELECT c.id AS id, e.private AS entry_is_private, e.user_id AS entry_user_id
+FROM comments c JOIN entries e ON c.entry_id = e.id
+WHERE c.user_id = ?
+ORDER BY c.id DESC
+LIMIT 20
+SQL
+    my @values = ();
+    for my $comment (@{db->select_all($query, $user_id)}) {
+        my $comment_id = $comment->{id};
+        my $entry_user_id = $comment->{entry_user_id};
+        if ($comment->{entry_is_private} && !permitted($entry_user_id, $friend_id)) {
+            next;
+        }
+        push @values, "($friend_id,$comment_id,$entry_user_id)";
+    }
+    db->query('INSERT INTO comments_of_friends VALUES ' . join q{,}, @values) if 0+@values;
+}
+
+sub delete_comments_of_friends {
+    my ($user_id, $friend_id) = @_;
+    my $comment_ids = [];
+    for my $comment (@{db->select_all('SELECT id FROM comments WHERE user_id = ?', $user_id)}) {
+        my $comment_id = $comment->{id};
+        push @$comment_ids, $comment_id;
+    }
+    db->query('DELETE FROM comments_of_friends WHERE user_id = ? AND comment_id IN (?)', $friend_id, $comment_ids);
+}
+
+sub initialize_comments_of_friends {
+    my $query = <<SQL;
+SELECT c.id AS id, c.user_id AS user_id, e.private AS entry_is_private, e.user_id AS entry_user_id
+FROM comments c JOIN entries e ON c.entry_id = e.id
+ORDER BY c.id DESC
+LIMIT 1000
+SQL
+    for my $comment (@{db->select_all($query)}) {
+        my $user_id = $comment->{user_id};
+        my $comment_id = $comment->{id};
+        my $entry_user_id = $comment->{entry_user_id};
+        my @values = ();
+        for my $friend_id (keys %{$relations{$user_id}}) {
+            if ($comment->{entry_is_private} && !permitted($entry_user_id, $friend_id)) {
+                next;
+            }
+            push @values, "($friend_id,$comment_id,$entry_user_id)";
+        }
+        db->query('INSERT INTO comments_of_friends VALUES ' . join q{,}, @values) if 0+@values;
+        say "comments_of_friends < comment_id: $comment_id";
+    }
+}
+
 1;
 
 __END__
@@ -573,6 +634,14 @@ CREATE TABLE `entries_of_friends` (
   `user_id` int NOT NULL,
   `entry_id` int NOT NULL,
   PRIMARY KEY (`user_id`,`entry_id`)
+) ENGINE=InnoDB CHARSET=utf8mb4;
+
+DROP TABLE IF EXISTS `comments_of_friends`;
+CREATE TABLE `comments_of_friends` (
+  `user_id` int NOT NULL,
+  `comment_id` int NOT NULL,
+  `entry_user_id` int NOT NULL,
+  PRIMARY KEY (`user_id`,`comment_id`)
 ) ENGINE=InnoDB CHARSET=utf8mb4;
 
 -- /etc/mysql/mysql.conf.d/mysqld.cnf
