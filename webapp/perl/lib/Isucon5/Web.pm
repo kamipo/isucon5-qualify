@@ -1,4 +1,5 @@
 package Isucon5::Web;
+use 5.020;
 
 use strict;
 use warnings;
@@ -85,6 +86,13 @@ sub current_user {
         abort_authentication_error();
     }
     return $user;
+}
+
+sub set_user_names {
+    my ($item, $user) = @_;
+    $item->{account_name} = $user->{account_name};
+    $item->{nick_name} = $user->{nick_name};
+    $item;
 }
 
 sub get_user {
@@ -204,12 +212,8 @@ ORDER BY c.created_at DESC
 LIMIT 10
 SQL
     my $comments_for_me = [];
-    my $comments = [];
     for my $comment (@{db->select_all($comments_for_me_query, current_user()->{id})}) {
-        my $comment_user = get_user($comment->{user_id});
-        $comment->{account_name} = $comment_user->{account_name};
-        $comment->{nick_name} = $comment_user->{nick_name};
-        push @$comments_for_me, $comment;
+        push @$comments_for_me, set_user_names($comment, get_user($comment->{user_id}));
     }
 
     my $entries_of_friends = [];
@@ -217,10 +221,7 @@ SQL
         next if (!is_friend($entry->{user_id}));
         my ($title) = split(/\n/, $entry->{body});
         $entry->{title} = $title;
-        my $owner = get_user($entry->{user_id});
-        $entry->{account_name} = $owner->{account_name};
-        $entry->{nick_name} = $owner->{nick_name};
-        push @$entries_of_friends, $entry;
+        push @$entries_of_friends, set_user_names($entry, get_user($entry->{user_id}));
         last if @$entries_of_friends+0 >= 10;
     }
 
@@ -230,14 +231,8 @@ SQL
         my $entry = db->select_row('SELECT * FROM entries WHERE id = ?', $comment->{entry_id});
         $entry->{is_private} = ($entry->{private} == 1);
         next if ($entry->{is_private} && !permitted($entry->{user_id}));
-        my $entry_owner = get_user($entry->{user_id});
-        $entry->{account_name} = $entry_owner->{account_name};
-        $entry->{nick_name} = $entry_owner->{nick_name};
-        $comment->{entry} = $entry;
-        my $comment_owner = get_user($comment->{user_id});
-        $comment->{account_name} = $comment_owner->{account_name};
-        $comment->{nick_name} = $comment_owner->{nick_name};
-        push @$comments_of_friends, $comment;
+        $comment->{entry} = set_user_names($entry, get_user($entry->{user_id}));
+        push @$comments_of_friends, set_user_names($comment, get_user($comment->{user_id}));
         last if @$comments_of_friends+0 >= 10;
     }
 
@@ -265,10 +260,7 @@ LIMIT 10
 SQL
     my $footprints = [];
     for my $fp (@{db->select_all($query, current_user()->{id})}) {
-        my $owner = get_user($fp->{owner_id});
-        $fp->{account_name} = $owner->{account_name};
-        $fp->{nick_name} = $owner->{nick_name};
-        push @$footprints, $fp;
+        push @$footprints, set_user_names($fp, get_user($fp->{owner_id}));
     }
 
     my $locals = {
@@ -389,10 +381,7 @@ get '/diary/entry/:entry_id' => [qw(set_global authenticated)] => sub {
     }
     my $comments = [];
     for my $comment (@{db->select_all('SELECT * FROM comments WHERE entry_id = ?', $entry->{id})}) {
-        my $comment_user = get_user($comment->{user_id});
-        $comment->{account_name} = $comment_user->{account_name};
-        $comment->{nick_name} = $comment_user->{nick_name};
-        push @$comments, $comment;
+        push @$comments, set_user_names($comment, get_user($comment->{user_id}));
     }
     mark_footprint($owner->{id});
     my $locals = {
@@ -441,10 +430,7 @@ LIMIT 50
 SQL
     my $footprints = [];
     for my $fp (@{db->select_all($query, current_user()->{id})}) {
-        my $owner = get_user($fp->{owner_id});
-        $fp->{account_name} = $owner->{account_name};
-        $fp->{nick_name} = $owner->{nick_name};
-        push @$footprints, $fp;
+        push @$footprints, set_user_names($fp, get_user($fp->{owner_id}));
     }
     $c->render('footprints.tx', { footprints => $footprints });
 };
@@ -457,14 +443,10 @@ get '/friends' => [qw(set_global authenticated)] => sub {
     for my $rel (@{db->select_all($query, current_user()->{id}, current_user()->{id})}) {
         my $key = ($rel->{one} == current_user()->{id} ? 'another' : 'one');
         $friends{$rel->{$key}} ||= do {
-            my $friend = get_user($rel->{$key});
-            $rel->{account_name} = $friend->{account_name};
-            $rel->{nick_name} = $friend->{nick_name};
-            push @$friends, $rel;
+            push @$friends, set_user_names($rel, get_user($rel->{$key}));
             $rel;
         };
     }
-    #my $friends = [ sort { $a->{created_at} lt $b->{created_at} } values(%friends) ];
     $c->render('friends.tx', { friends => $friends });
 };
 
