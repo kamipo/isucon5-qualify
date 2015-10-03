@@ -232,24 +232,42 @@ SQL
         push @$comments_for_me, set_user_names($comment, get_user($comment->{user_id}));
     }
 
+    my $friend_ids = [];
+    for my $rel (@{db->select_all('SELECT another FROM relations WHERE one = ?', current_user()->{id})}) {
+        push @$friend_ids, $rel->{another};
+    }
+
+    my $entries_of_friends_query = <<SQL;
+SELECT *
+FROM entries
+WHERE user_id IN (?)
+ORDER BY id DESC
+LIMIT 10
+SQL
     my $entries_of_friends = [];
-    for my $entry (@{db->select_all('SELECT * FROM entries ORDER BY created_at DESC LIMIT 1000')}) {
-        next if (!is_friend($entry->{user_id}));
+    for my $entry (@{db->select_all($entries_of_friends_query, $friend_ids)}) {
         my ($title) = split(/\n/, $entry->{body});
         $entry->{title} = $title;
         push @$entries_of_friends, set_user_names($entry, get_user($entry->{user_id}));
-        last if @$entries_of_friends+0 >= 10;
     }
 
+    my $comments_of_friends_query = <<SQL;
+SELECT c.user_id AS user_id, c.comment AS comment, c.created_at AS created_at, e.user_id AS entry_user_id
+FROM comments c
+JOIN entries e ON c.entry_id = e.id
+WHERE c.user_id IN (?)
+AND (
+  e.private = 0
+  OR
+  e.private = 1 AND (e.user_id = ? OR e.user_id IN (?))
+)
+ORDER BY c.id DESC
+LIMIT 10
+SQL
     my $comments_of_friends = [];
-    for my $comment (@{db->select_all('SELECT * FROM comments ORDER BY created_at DESC LIMIT 1000')}) {
-        next if (!is_friend($comment->{user_id}));
-        my $entry = db->select_row('SELECT * FROM entries WHERE id = ?', $comment->{entry_id});
-        $entry->{is_private} = ($entry->{private} == 1);
-        next if ($entry->{is_private} && !permitted($entry->{user_id}));
-        $comment->{entry} = set_user_names($entry, get_user($entry->{user_id}));
+    for my $comment (@{db->select_all($comments_of_friends_query, $friend_ids, current_user()->{id}, $friend_ids)}) {
+        $comment->{entry} = set_user_names(+{}, get_user($comment->{entry_user_id}));
         push @$comments_of_friends, set_user_names($comment, get_user($comment->{user_id}));
-        last if @$comments_of_friends+0 >= 10;
     }
 
     my $query = 'SELECT owner_id, created_at AS updated FROM footprints WHERE user_id = ? ORDER BY id DESC LIMIT 10';
@@ -463,6 +481,8 @@ __END__
 
 ALTER TABLE profiles ADD COLUMN friends int AFTER pref;
 ALTER TABLE relations ADD INDEX friendlist (one);
+ALTER TABLE comments ADD INDEX user_id (user_id), DROP INDEX created_at;
+ALTER TABLE entries DROP INDEX created_at;
 
 CREATE TABLE fp LIKE footprints;
 ALTER TABLE fp ADD COLUMN date date NOT NULL, ADD UNIQUE INDEX unique_per_day (user_id,owner_id,date), ADD INDEX user_id (user_id);
