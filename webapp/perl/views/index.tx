@@ -14,7 +14,7 @@
       <dt>性別</dt><dd id="prof-sex"><: ($profile['sex']) || '未入力' :></dd>
       <dt>誕生日</dt><dd id="prof-birthday"><: ($profile['birthday']) || '未入力' :></dd>
       <dt>住んでいる県</dt><dd id="prof-pref"><: ($profile['pref']) || '未入力' :></dd>
-      <dt>友だちの人数</dt><dd id="prof-friends"><a href="/friends"><: $friends.size() :>人</a></dd>
+      <dt>友だちの人数</dt><dd id="prof-friends"><a href="/friends"><: $profile['friends'] :>人</a></dd>
     </dl>
   </div>
   <div class="col-md-4">

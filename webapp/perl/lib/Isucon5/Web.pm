@@ -8,26 +8,47 @@ use Kossy;
 use DBIx::Sunny;
 use Encode;
 
+my %users_by_id = ();
+my %users_by_name = ();
+my %users_by_email = ();
+my %relations = ();
+{
+    my $db = dbh();
+
+    for my $user (@{$db->select_all('SELECT id, account_name, nick_name, email, account_name AS password FROM users')}) {
+        $users_by_id{$user->{id}} = $user;
+        $users_by_name{$user->{account_name}} = $user;
+        $users_by_email{$user->{email}} = $user;
+    }
+
+    for my $rel (@{$db->select_all('SELECT one, another FROM relations WHERE id <= 500000')}) {
+        $relations{$rel->{one}} ||= {};
+        $relations{$rel->{one}}{$rel->{another}} = 1;
+    }
+}
+
+sub dbh {
+    my %db = (
+        host => $ENV{ISUCON5_DB_HOST} || 'localhost',
+        port => $ENV{ISUCON5_DB_PORT} || 3306,
+        username => $ENV{ISUCON5_DB_USER} || 'root',
+        password => $ENV{ISUCON5_DB_PASSWORD},
+        database => $ENV{ISUCON5_DB_NAME} || 'isucon5q',
+    );
+    DBIx::Sunny->connect(
+        "dbi:mysql:database=$db{database};host=$db{host};port=$db{port}", $db{username}, $db{password}, {
+            RaiseError => 1,
+            PrintError => 0,
+            AutoInactiveDestroy => 1,
+            mysql_enable_utf8   => 1,
+            mysql_auto_reconnect => 1,
+        },
+    );
+}
+
 my $db;
 sub db {
-    $db ||= do {
-        my %db = (
-            host => $ENV{ISUCON5_DB_HOST} || 'localhost',
-            port => $ENV{ISUCON5_DB_PORT} || 3306,
-            username => $ENV{ISUCON5_DB_USER} || 'root',
-            password => $ENV{ISUCON5_DB_PASSWORD},
-            database => $ENV{ISUCON5_DB_NAME} || 'isucon5q',
-        );
-        DBIx::Sunny->connect(
-            "dbi:mysql:database=$db{database};host=$db{host};port=$db{port}", $db{username}, $db{password}, {
-                RaiseError => 1,
-                PrintError => 0,
-                AutoInactiveDestroy => 1,
-                mysql_enable_utf8   => 1,
-                mysql_auto_reconnect => 1,
-            },
-        );
-    };
+    $db ||= dbh();
 }
 
 my ($SELF, $C);
@@ -58,14 +79,8 @@ sub abort_content_not_found {
 
 sub authenticate {
     my ($email, $password) = @_;
-    my $query = <<SQL;
-SELECT u.id AS id, u.account_name AS account_name, u.nick_name AS nick_name, u.email AS email
-FROM users u
-JOIN salts s ON u.id = s.user_id
-WHERE u.email = ? AND u.passhash = SHA2(CONCAT(?, s.salt), 512)
-SQL
-    my $result = db->select_row($query, $email, $password);
-    if (!$result) {
+    my $result = $users_by_email{$email};
+    if (!$result or $result->{password} ne $password) {
         abort_authentication_error();
     }
     session()->{user_id} = $result->{id};
@@ -80,7 +95,7 @@ sub current_user {
 
     return undef if (!session()->{user_id});
 
-    $user = db->select_row('SELECT id, account_name, nick_name, email FROM users WHERE id=?', session()->{user_id});
+    $user = $users_by_id{session()->{user_id}};
     if (!$user) {
         session()->{user_id} = undef;
         abort_authentication_error();
@@ -97,14 +112,14 @@ sub set_user_names {
 
 sub get_user {
     my ($user_id) = @_;
-    my $user = db->select_row('SELECT * FROM users WHERE id = ?', $user_id);
+    my $user = $users_by_id{$user_id};
     abort_content_not_found() if (!$user);
     return $user;
 }
 
 sub user_from_account {
     my ($account_name) = @_;
-    my $user = db->select_row('SELECT * FROM users WHERE account_name = ?', $account_name);
+    my $user = $users_by_name{$account_name};
     abort_content_not_found() if (!$user);
     return $user;
 }
@@ -112,8 +127,9 @@ sub user_from_account {
 sub is_friend {
     my ($another_id) = @_;
     my $user_id = session()->{user_id};
-    my $query = 'SELECT COUNT(1) AS cnt FROM relations WHERE (one = ? AND another = ?) OR (one = ? AND another = ?)';
-    my $cnt = db->select_one($query, $user_id, $another_id, $another_id, $user_id);
+    return 1 if $relations{$user_id}{$another_id};
+    my $query = 'SELECT COUNT(1) AS cnt FROM relations WHERE one = ? AND another = ?';
+    my $cnt = db->select_one($query, $user_id, $another_id);
     return $cnt > 0 ? 1 : 0;
 }
 
@@ -125,7 +141,7 @@ sub is_friend_account {
 sub mark_footprint {
     my ($user_id) = @_;
     if ($user_id != current_user()->{id}) {
-        my $query = 'INSERT INTO footprints (user_id,owner_id) VALUES (?,?)';
+        my $query = 'REPLACE INTO footprints (user_id,owner_id,date) VALUES (?,?,NOW())';
         db->query($query, $user_id, current_user()->{id});
     }
 }
@@ -193,13 +209,9 @@ get '/' => [qw(set_global authenticated)] => sub {
 
     my $profile = db->select_row('SELECT * FROM profiles WHERE user_id = ?', current_user()->{id});
 
-    my $entries_query = 'SELECT * FROM entries WHERE user_id = ? ORDER BY created_at LIMIT 5';
+    my $entries_query = "SELECT id, SUBSTRING_INDEX(body, '\n', 1) AS title FROM entries WHERE user_id = ? ORDER BY created_at LIMIT 5";
     my $entries = [];
     for my $entry (@{db->select_all($entries_query, current_user()->{id})}) {
-        $entry->{is_private} = ($entry->{private} == 1);
-        my ($title, $content) = split(/\n/, $entry->{body}, 2);
-        $entry->{title} = $title;
-        $entry->{content} = $content;
         push @$entries, $entry;
     }
 
@@ -216,48 +228,43 @@ SQL
         push @$comments_for_me, set_user_names($comment, get_user($comment->{user_id}));
     }
 
-    my $entries_of_friends = [];
-    for my $entry (@{db->select_all('SELECT * FROM entries ORDER BY created_at DESC LIMIT 1000')}) {
-        next if (!is_friend($entry->{user_id}));
-        my ($title) = split(/\n/, $entry->{body});
-        $entry->{title} = $title;
-        push @$entries_of_friends, set_user_names($entry, get_user($entry->{user_id}));
-        last if @$entries_of_friends+0 >= 10;
+    my $friend_ids = [];
+    for my $rel (@{db->select_all('SELECT another FROM relations WHERE one = ?', current_user()->{id})}) {
+        push @$friend_ids, $rel->{another};
     }
 
-    my $comments_of_friends = [];
-    for my $comment (@{db->select_all('SELECT * FROM comments ORDER BY created_at DESC LIMIT 1000')}) {
-        next if (!is_friend($comment->{user_id}));
-        my $entry = db->select_row('SELECT * FROM entries WHERE id = ?', $comment->{entry_id});
-        $entry->{is_private} = ($entry->{private} == 1);
-        next if ($entry->{is_private} && !permitted($entry->{user_id}));
-        $comment->{entry} = set_user_names($entry, get_user($entry->{user_id}));
-        push @$comments_of_friends, set_user_names($comment, get_user($comment->{user_id}));
-        last if @$comments_of_friends+0 >= 10;
-    }
-
-    my $friends_query = 'SELECT * FROM relations WHERE one = ? OR another = ? ORDER BY created_at DESC';
-    my %friends = ();
-    my $friends = [];
-    for my $rel (@{db->select_all($friends_query, current_user()->{id}, current_user()->{id})}) {
-        my $key = ($rel->{one} == current_user()->{id} ? 'another' : 'one');
-        $friends{$rel->{$key}} ||= do {
-            my $friend = get_user($rel->{$key});
-            $rel->{account_name} = $friend->{account_name};
-            $rel->{nick_name} = $friend->{nick_name};
-            push @$friends, $rel;
-            $rel;
-        };
-    }
-
-    my $query = <<SQL;
-SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) as updated
-FROM footprints
-WHERE user_id = ?
-GROUP BY user_id, owner_id, DATE(created_at)
-ORDER BY updated DESC
+    my $entries_of_friends_query = <<SQL;
+SELECT id, user_id, SUBSTRING_INDEX(body, '\n', 1) AS title, created_at
+FROM entries
+WHERE user_id IN (?)
+ORDER BY id DESC
 LIMIT 10
 SQL
+    my $entries_of_friends = [];
+    for my $entry (@{db->select_all($entries_of_friends_query, $friend_ids)}) {
+        push @$entries_of_friends, set_user_names($entry, get_user($entry->{user_id}));
+    }
+
+    my $comments_of_friends_query = <<SQL;
+SELECT c.user_id AS user_id, c.comment AS comment, c.created_at AS created_at, e.user_id AS entry_user_id
+FROM comments c
+JOIN entries e ON c.entry_id = e.id
+WHERE c.user_id IN (?)
+AND (
+  e.private = 0
+  OR
+  e.private = 1 AND (e.user_id = ? OR e.user_id IN (?))
+)
+ORDER BY c.id DESC
+LIMIT 10
+SQL
+    my $comments_of_friends = [];
+    for my $comment (@{db->select_all($comments_of_friends_query, $friend_ids, current_user()->{id}, $friend_ids)}) {
+        $comment->{entry} = set_user_names(+{}, get_user($comment->{entry_user_id}));
+        push @$comments_of_friends, set_user_names($comment, get_user($comment->{user_id}));
+    }
+
+    my $query = 'SELECT owner_id, created_at AS updated FROM footprints WHERE user_id = ? ORDER BY id DESC LIMIT 10';
     my $footprints = [];
     for my $fp (@{db->select_all($query, current_user()->{id})}) {
         push @$footprints, set_user_names($fp, get_user($fp->{owner_id}));
@@ -270,7 +277,6 @@ SQL
         'comments_for_me' => $comments_for_me,
         'entries_of_friends' => $entries_of_friends,
         'comments_of_friends' => $comments_of_friends,
-        'friends' => $friends,
         'footprints' => $footprints
     };
     $c->render('index.tx', $locals);
@@ -420,14 +426,7 @@ post '/diary/comment/:entry_id' => [qw(set_global authenticated)] => sub {
 
 get '/footprints' => [qw(set_global authenticated)] => sub {
     my ($self, $c) = @_;
-    my $query = <<SQL;
-SELECT user_id, owner_id, DATE(created_at) AS date, MAX(created_at) as updated
-FROM footprints
-WHERE user_id = ?
-GROUP BY user_id, owner_id, DATE(created_at)
-ORDER BY updated DESC
-LIMIT 50
-SQL
+    my $query = 'SELECT owner_id, created_at AS updated FROM footprints WHERE user_id = ? ORDER BY id DESC LIMIT 50';
     my $footprints = [];
     for my $fp (@{db->select_all($query, current_user()->{id})}) {
         push @$footprints, set_user_names($fp, get_user($fp->{owner_id}));
@@ -437,15 +436,10 @@ SQL
 
 get '/friends' => [qw(set_global authenticated)] => sub {
     my ($self, $c) = @_;
-    my $query = 'SELECT * FROM relations WHERE one = ? OR another = ? ORDER BY created_at DESC';
-    my %friends = ();
+    my $query = 'SELECT * FROM relations WHERE one = ? ORDER BY id DESC';
     my $friends = [];
-    for my $rel (@{db->select_all($query, current_user()->{id}, current_user()->{id})}) {
-        my $key = ($rel->{one} == current_user()->{id} ? 'another' : 'one');
-        $friends{$rel->{$key}} ||= do {
-            push @$friends, set_user_names($rel, get_user($rel->{$key}));
-            $rel;
-        };
+    for my $rel (@{db->select_all($query, current_user()->{id})}) {
+        push @$friends, set_user_names($rel, get_user($rel->{another}));
     }
     $c->render('friends.tx', { friends => $friends });
 };
@@ -457,6 +451,7 @@ post '/friends/:account_name' => [qw(set_global authenticated)] => sub {
         my $user = user_from_account($account_name);
         abort_content_not_found() if (!$user);
         db->query('INSERT INTO relations (one, another) VALUES (?,?), (?,?)', current_user()->{id}, $user->{id}, $user->{id}, current_user()->{id});
+        db->query('UPDATE profiles SET friends = friends + 1 WHERE user_id IN (?,?)', current_user()->{id}, $user->{id});
         redirect('/friends');
     }
 };
@@ -467,6 +462,40 @@ get '/initialize' => sub {
     db->query("DELETE FROM footprints WHERE id > 500000");
     db->query("DELETE FROM entries WHERE id > 500000");
     db->query("DELETE FROM comments WHERE id > 1500000");
+    db->query(<<SQL);
+UPDATE profiles p
+JOIN (SELECT one, COUNT(*) AS friends FROM relations GROUP BY one) r
+ON p.user_id = r.one SET p.friends = r.friends
+SQL
 };
 
 1;
+
+__END__
+
+ALTER TABLE profiles ADD COLUMN friends int AFTER pref;
+ALTER TABLE relations ADD INDEX friendlist (one);
+ALTER TABLE comments ADD INDEX user_id (user_id), DROP INDEX created_at;
+ALTER TABLE entries DROP INDEX created_at;
+
+CREATE TABLE fp LIKE footprints;
+ALTER TABLE fp ADD COLUMN date date NOT NULL, ADD UNIQUE INDEX unique_per_day (user_id,owner_id,date), ADD INDEX user_id (user_id);
+REPLACE INTO fp SELECT id, user_id, owner_id, created_at, DATE(created_at) FROM footprints WHERE id <= 500000;
+RENAME TABLE footprints TO footprints_old, fp TO footprints;
+
+-- /etc/mysql/mysql.conf.d/mysqld.cnf
+[mysqld]
+performance_schema = OFF
+transaction_isolation = READ-COMMITTED
+
+innodb_strict_mode
+innodb_file_format = Barracuda
+innodb_autoinc_lock_mode = 2
+
+innodb_buffer_pool_size = 2G
+innodb_log_file_size = 128M
+innodb_flush_log_at_trx_commit = 0
+innodb_doublewrite = 0
+
+innodb_buffer_pool_dump_at_shutdown
+innodb_buffer_pool_load_at_startup
